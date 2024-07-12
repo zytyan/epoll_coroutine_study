@@ -85,6 +85,38 @@ int set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+#define SAVE_ERRNO(x) do {\
+    int _errno = errno;\
+    x;\
+    errno = _errno;\
+} while(0)
+
+static ssize_t coroutine_block_read(int fd, void *buf, size_t count) {
+    while (true) {
+        ssize_t read_size = read(fd, buf, count);
+        if (read_size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            SAVE_ERRNO(co_block());
+            continue;
+        }
+        return read_size;
+    }
+}
+
+static ssize_t coroutine_block_write(int fd, const void *buf, size_t count) {
+    while (true) {
+        ssize_t write_size = write(fd, buf, count);
+        if (write_size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            SAVE_ERRNO(co_block());
+            continue;
+        }
+        return write_size;
+    }
+}
+
+static bool str_has_prefix(const char *str, const char *prefix) {
+    return strncmp(str, prefix, strlen(prefix)) == 0;
+}
+
 void handle_client(void *arg) {
     struct my_epoll_data *data = (struct my_epoll_data *) arg;
     data->co = get_current_coroutine();
@@ -92,45 +124,45 @@ void handle_client(void *arg) {
     int fd = data->fd;
     char buffer[1024] = {0};
     while (true) {
-        reread:;
         if (data->events & EPOLLHUP) {
             printf("EPOLLHUP\n");
             close(fd);
             free(data);
             return;
         }
-        ssize_t read_size = read(fd, buffer, sizeof(buffer) - 1);
+        ssize_t read_size = coroutine_block_read(fd, buffer, sizeof(buffer) - 1);
         if (read_size <= 0) {
-            if (read_size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                co_block();
-                goto reread;
-            } else {
-                printf("stop read\n");
-                close(fd);
-                free(data);
-                return;
-            }
+            printf("stop read\n");
+            close(fd);
+            free(data);
+            return;
         }
         buffer[read_size] = '\0';
         print_all_coroutine();
         printf("Received: %s\n", buffer);
-        rewrite:;
-        if (data->events & EPOLLHUP) {
-            printf("EPOLLHUP\n");
+        if (str_has_prefix(buffer, "exit")) {
             close(fd);
             free(data);
             return;
         }
-        ssize_t write_size = write(fd, buffer, read_size);
-        if (write_size <= 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                co_block();
-                goto rewrite;
-            } else {
+        if (str_has_prefix(buffer, "GET ")) {
+            const char *response = "HTTP/1.1 200 OK\r\n"
+                                   "Content-Type: text/plain\r\n"
+                                   "Content-Length: 14\r\n\r\n"
+                                   "Hello world!\r\n";
+            ssize_t write_size = coroutine_block_write(fd, response, strlen(response));
+            if (write_size <= 0) {
                 close(fd);
                 free(data);
                 return;
             }
+            continue;
+        }
+        ssize_t write_size = coroutine_block_write(fd, buffer, read_size);
+        if (write_size <= 0) {
+            close(fd);
+            free(data);
+            return;
         }
     }
 }
