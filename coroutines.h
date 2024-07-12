@@ -8,29 +8,49 @@
 
 #include <unistd.h>
 #include <stdbool.h>
+#include <stdint.h>
 
+enum coroutine_status {
+    COROUTINE_STATUS_IDLE,
+    COROUTINE_STATUS_RUNNING,
+    COROUTINE_STATUS_PENDING,
+    COROUTINE_STATUS_BLOCKED,
+};
 struct coroutine {
     void *jmp_env;
     void *stack;
     ssize_t stack_size;
+    char *name;
+    enum coroutine_status status;
 };
 
 typedef void (*coroutine_func)(void *);
 
-void init_all_coroutine();
+struct coroutine *setup_coroutine(uint32_t max_count);
 
-void deinit_all_coroutine();
+int teardown_coroutine();
 
 struct coroutine *get_current_coroutine();
 
-void suspend_coroutine();
+int new_coroutine(coroutine_func func, void *arg);
 
-void resume_coroutine(struct coroutine *co);
+void co_pending();
 
-struct coroutine *new_coroutine(coroutine_func func, void *arg);
+void co_block();
 
-static inline bool is_coroutine_running(struct coroutine *co) {
-    return co != NULL && co->jmp_env != NULL;
+struct coroutine *co_get_pending();
+
+void co_clear_block(struct coroutine *co);
+
+void print_all_coroutine();
+
+bool co_has_pending();
+
+static inline bool is_coroutine_runnable(struct coroutine *co) {
+    if (co == NULL) {
+        return false;
+    }
+    return co->status == COROUTINE_STATUS_PENDING && co->jmp_env != NULL;
 }
 
 #endif //EPOLL_COROUTINE_COROUTINES_H

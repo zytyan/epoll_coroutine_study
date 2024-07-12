@@ -1,55 +1,225 @@
-//
-// Created by qxy on 24-7-10.
-//
 #include <stdio.h>
-#include <setjmp.h>
+#include <stdlib.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <signal.h>
+#include <fcntl.h>
 #include "coroutines.h"
 
-void test_coroutine_1(__attribute__((unused)) void *dummy) {
-    printf("this is test coroutine 1 before, current coroutine: %p\n", get_current_coroutine());
-    suspend_coroutine();
-    printf("this is test coroutine 1 after, current coroutine: %p\n", get_current_coroutine());
-}
+#define MAX_EVENTS 2048
+#define PORT 8080
+static bool g_running = true;
 
-void test_coroutine_2(__attribute__((unused)) void *dummy) {
-    printf("this is test coroutine 2 before, current coroutine: %p\n", get_current_coroutine());
-    suspend_coroutine();
-    printf("this is test coroutine 2 after, current coroutine: %p\n", get_current_coroutine());
-}
-
-void test_coroutine_3(__attribute__((unused)) void *dummy) {
-    for (int i = 0; i < 30; i++) {
-        printf("this is test coroutine 3 before i=%d, current coroutine: %p\n", i, get_current_coroutine());
-        suspend_coroutine();
-        printf("this is test coroutine 3 after i=%d, current coroutine: %p\n", i, get_current_coroutine());
+void sig_handler(int signo) {
+    if (signo == SIGINT) {
+        g_running = false;
     }
 }
 
-void test_coroutine_4(__attribute__((unused)) void *dummy) {
-    for (int i = 0; i < 30; i++) {
-        printf("this is test coroutine 4 before i=%d, current coroutine: %p\n", i, get_current_coroutine());
-        suspend_coroutine();
-        printf("this is test coroutine 4 after i=%d, current coroutine: %p\n", i, get_current_coroutine());
+int set_server_socket() {
+    int server_fd;
+    struct sockaddr_in address;
+    // 创建socket
+    if ((server_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)) == 0) {
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // 设置socket选项
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        perror("setsockopt");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // 绑定socket
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    if (bind(server_fd, (struct sockaddr *) &address, sizeof(address)) < 0) {
+        perror("bind failed");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // 监听socket
+    if (listen(server_fd, 3) < 0) {
+        perror("listen");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+    return server_fd;
+}
+
+struct my_epoll_data {
+    int fd;
+    int epoll_fd;
+    uint32_t events;
+    struct coroutine *co;
+
+    void (*on_event)(void *);
+};
+
+void default_on_event(void *_) {
+    printf("default_on_event xxx\n");
+}
+
+void real_on_event(void *arg) {
+    struct my_epoll_data *data = (struct my_epoll_data *) arg;
+    co_clear_block(data->co);
+}
+
+int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) {
+        return -1;
+    }
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+void handle_client(void *arg) {
+    struct my_epoll_data *data = (struct my_epoll_data *) arg;
+    data->co = get_current_coroutine();
+    data->on_event = real_on_event;
+    int fd = data->fd;
+    char buffer[1024] = {0};
+    while (true) {
+        reread:;
+        if (data->events & EPOLLHUP) {
+            printf("EPOLLHUP\n");
+            close(fd);
+            free(data);
+            return;
+        }
+        ssize_t read_size = read(fd, buffer, sizeof(buffer) - 1);
+        if (read_size <= 0) {
+            if (read_size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                co_block();
+                goto reread;
+            } else {
+                printf("stop read\n");
+                close(fd);
+                free(data);
+                return;
+            }
+        }
+        buffer[read_size] = '\0';
+        print_all_coroutine();
+        printf("Received: %s\n", buffer);
+        rewrite:;
+        if (data->events & EPOLLHUP) {
+            printf("EPOLLHUP\n");
+            close(fd);
+            free(data);
+            return;
+        }
+        ssize_t write_size = write(fd, buffer, read_size);
+        if (write_size <= 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                co_block();
+                goto rewrite;
+            } else {
+                close(fd);
+                free(data);
+                return;
+            }
+        }
     }
 }
+
+void handle_server(int epoll_fd, int server_fd) {
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    int new_socket = accept(server_fd, (struct sockaddr *) &client_addr, &client_len);
+    if (new_socket == -1) {
+        perror("accept");
+        return;
+    }
+    set_nonblocking(new_socket);
+    struct epoll_event event;
+    event.events = EPOLLIN | EPOLLET;
+    event.data.ptr = malloc(sizeof(struct my_epoll_data));
+    struct my_epoll_data *data = (struct my_epoll_data *) event.data.ptr;
+    data->fd = new_socket;
+    data->epoll_fd = epoll_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_socket, &event) == -1) {
+        free(event.data.ptr);
+        perror("epoll_ctl: new_socket");
+        close(new_socket);
+    }
+    new_coroutine(handle_client, data);
+}
+
+void handle_events(struct epoll_event *events, int num_events, int epoll_fd, int server_fd) {
+    for (int i = 0; i < num_events; i++) {
+        if (events[i].events & EPOLLIN) {
+            // 处理可读事件
+            int fd = events[i].data.fd;
+            if (fd == server_fd) {
+                handle_server(epoll_fd, server_fd);
+            }
+        }
+        if (events[i].data.fd == server_fd) {
+            continue;
+        }
+        struct my_epoll_data *data = (struct my_epoll_data *) events[i].data.ptr;
+        printf("events: %d\n", events[i].events);
+        data->events = events[i].events;
+        data->on_event(data);
+    }
+}
+
 
 int main() {
-    init_all_coroutine();
-    printf("sizeof(jmp_buf) = %ld", sizeof(jmp_buf));
-    struct coroutine *co1 = new_coroutine(test_coroutine_1, NULL);
-    struct coroutine *co2 = new_coroutine(test_coroutine_2, NULL);
-    resume_coroutine(co1);
-    resume_coroutine(co2);
-    resume_coroutine(co1);
-    resume_coroutine(co2);
-    resume_coroutine(co1);
+    int server_fd = set_server_socket();
+    struct epoll_event event, events[MAX_EVENTS];
 
-    struct coroutine *co3 = new_coroutine(test_coroutine_3, NULL);
-    struct coroutine *co4 = new_coroutine(test_coroutine_4, NULL);
-    while (is_coroutine_running(co3) || is_coroutine_running(co4)) {
-        resume_coroutine(co3);
-        resume_coroutine(co4);
+    setup_coroutine(1000);
+    // 创建epoll实例
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) {
+        perror("epoll_create1");
+        close(server_fd);
+        exit(EXIT_FAILURE);
     }
-    deinit_all_coroutine();
+
+    // 将服务器socket注册到epoll实例
+    event.events = EPOLLIN | EPOLLET;
+    event.data.fd = server_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event) == -1) {
+        perror("epoll_ctl: server_fd");
+        close(server_fd);
+        close(epoll_fd);
+        exit(EXIT_FAILURE);
+    }
+    signal(SIGINT, sig_handler);
+    // 事件循环
+    while (g_running) {
+        int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        if (num_events == -1) {
+            perror("epoll_wait");
+            close(server_fd);
+            close(epoll_fd);
+            exit(EXIT_FAILURE);
+        }
+        handle_events(events, num_events, epoll_fd, server_fd);
+        printf("co_has_pending: %d\n", co_has_pending());
+        while (co_has_pending()) {
+            printf("co_pending...\n");
+            co_pending();
+        }
+    }
+
+    close(server_fd);
+    close(epoll_fd);
     return 0;
 }
+
