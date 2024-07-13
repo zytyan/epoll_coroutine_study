@@ -15,6 +15,7 @@ enum coroutine_status {
     COROUTINE_STATUS_RUNNING,
     COROUTINE_STATUS_PENDING,
     COROUTINE_STATUS_BLOCKED,
+    COROUTINE_STATUS_SLEEPING,
 };
 struct coroutine {
     void *jmp_env;
@@ -32,9 +33,9 @@ int teardown_coroutine();
 
 struct coroutine *get_current_coroutine();
 
-int new_coroutine(coroutine_func func, void *arg);
+int new_coroutine(coroutine_func func, void *arg, char *name);
 
-void co_pending();
+void co_dispatch();
 
 void co_block();
 
@@ -42,9 +43,13 @@ struct coroutine *co_get_pending();
 
 void co_clear_block(struct coroutine *co);
 
-void print_all_coroutine();
+int64_t co_min_wait_time();
+
+void co_sleep(int64_t ns);
 
 bool co_has_pending();
+
+void print_all_coroutine();
 
 static inline bool is_coroutine_runnable(struct coroutine *co) {
     if (co == NULL) {

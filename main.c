@@ -10,6 +10,8 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <arpa/inet.h>
 #include "coroutines.h"
 
 #define MAX_EVENTS 2048
@@ -68,13 +70,11 @@ struct my_epoll_data {
     void (*on_event)(void *);
 };
 
-void default_on_event(void *_) {
-    printf("default_on_event xxx\n");
-}
-
 void real_on_event(void *arg) {
     struct my_epoll_data *data = (struct my_epoll_data *) arg;
-    co_clear_block(data->co);
+    if (data->co) {
+        co_clear_block(data->co);
+    }
 }
 
 int set_nonblocking(int fd) {
@@ -145,6 +145,7 @@ void handle_client(void *arg) {
             free(data);
             return;
         }
+        co_sleep(5000000000);// 5s
         if (str_has_prefix(buffer, "GET ")) {
             const char *response = "HTTP/1.1 200 OK\r\n"
                                    "Content-Type: text/plain\r\n"
@@ -167,6 +168,10 @@ void handle_client(void *arg) {
     }
 }
 
+int format_socket_address(struct sockaddr_in *addr, char *buf, size_t size) {
+    return snprintf(buf, 32, "%s:%d", inet_ntoa(addr->sin_addr), ntohs(addr->sin_port));
+}
+
 void handle_server(int epoll_fd, int server_fd) {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
@@ -182,12 +187,16 @@ void handle_server(int epoll_fd, int server_fd) {
     struct my_epoll_data *data = (struct my_epoll_data *) event.data.ptr;
     data->fd = new_socket;
     data->epoll_fd = epoll_fd;
+    data->on_event = real_on_event;
+    data->co = NULL;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_socket, &event) == -1) {
         free(event.data.ptr);
         perror("epoll_ctl: new_socket");
         close(new_socket);
     }
-    new_coroutine(handle_client, data);
+    char name[32];
+    format_socket_address(&client_addr, name, sizeof(name));
+    new_coroutine(handle_client, data, name);
 }
 
 void handle_events(struct epoll_event *events, int num_events, int epoll_fd, int server_fd) {
@@ -205,7 +214,9 @@ void handle_events(struct epoll_event *events, int num_events, int epoll_fd, int
         struct my_epoll_data *data = (struct my_epoll_data *) events[i].data.ptr;
         printf("events: %d\n", events[i].events);
         data->events = events[i].events;
-        data->on_event(data);
+        if (data->on_event) {
+            data->on_event(data);
+        }
     }
 }
 
@@ -235,7 +246,15 @@ int main() {
     signal(SIGINT, sig_handler);
     // 事件循环
     while (g_running) {
-        int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        int64_t wait_ns = co_min_wait_time();
+        int wait_ms;
+        if (wait_ns == -1) {
+            wait_ms = -1;
+        } else {
+            int64_t wms = wait_ns / 1000000;
+            wait_ms = wms > INT_MAX ? INT_MAX : (int) wms;
+        }
+        int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, wait_ms);
         if (num_events == -1) {
             perror("epoll_wait");
             close(server_fd);
@@ -245,11 +264,11 @@ int main() {
         handle_events(events, num_events, epoll_fd, server_fd);
         printf("co_has_pending: %d\n", co_has_pending());
         while (co_has_pending()) {
-            printf("co_pending...\n");
-            co_pending();
+            printf("co_dispatch...\n");
+            co_dispatch();
         }
     }
-
+    teardown_coroutine();
     close(server_fd);
     close(epoll_fd);
     return 0;

@@ -6,10 +6,13 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <setjmp.h>
+#include <time.h>
+#include <string.h>
 #include "coroutines.h"
+#include "heap.h"
 
 #define STACK_SIZE (128 * 1024)
-
+#define NAME_LEN 32
 // region coroutine_queue
 struct coroutine_queue {
     struct coroutine **coroutines;
@@ -67,9 +70,12 @@ static bool queue_full(struct coroutine_queue *queue) {
 }
 
 // endregion
+
 static struct coroutine_queue co_idle_queue = {0};
 static struct coroutine_queue co_pending_queue = {0};
 static struct coroutine_queue co_all_queue = {0};
+static struct quad_heap co_sleeping_heap = {0};
+
 static uint32_t max_coroutine_count = 0;
 static uint32_t inited_coroutine_count = 0;
 static struct coroutine *g_main_co = NULL;
@@ -84,7 +90,11 @@ static void init_coroutine(struct coroutine *co) {
     co->jmp_env = NULL;
     co->stack = stack + STACK_SIZE;//stack grows down
     co->stack_size = STACK_SIZE;
-    co->name = "<inited>";
+    co->name = malloc(NAME_LEN);
+    if (co->name == NULL) {
+        perror("malloc failed");
+        abort();
+    }
 }
 
 static void deinit_coroutine(struct coroutine *co) {
@@ -92,6 +102,8 @@ static void deinit_coroutine(struct coroutine *co) {
     co->stack = NULL;
     co->stack_size = 0;
     co->jmp_env = NULL;
+    free(co->name);
+    co->name = NULL;
     free(co);
 }
 
@@ -130,8 +142,18 @@ struct coroutine *setup_coroutine(uint32_t max_count) {
         deinit_queue(&co_pending_queue);
         return NULL;
     }
+    if (init_heap(&co_sleeping_heap, max_coroutine_count) != 0) {
+        deinit_queue(&co_idle_queue);
+        deinit_queue(&co_pending_queue);
+        deinit_queue(&co_all_queue);
+        return NULL;
+    }
     struct coroutine *main_co = malloc(sizeof(struct coroutine));
     if (main_co == NULL) {
+        deinit_queue(&co_idle_queue);
+        deinit_queue(&co_pending_queue);
+        deinit_queue(&co_all_queue);
+        deinit_heap(&co_sleeping_heap);
         return NULL;
     }
     init_coroutine(main_co);
@@ -203,14 +225,13 @@ struct coroutine *co_get_pending() {
     return pop_queue(&co_pending_queue);
 }
 
-void co_pending() {
+void co_dispatch() {
     set_coroutine_status(get_current_coroutine(), COROUTINE_STATUS_PENDING);
     if (queue_size(&co_pending_queue) == 0) {
         printf("queue_size(&co_pending_queue) == 0\n");
         abort();
     }
     struct coroutine *co = pop_queue(&co_pending_queue);
-    printf("co_name = %s, co = %p, current = %p\n", co->name, co, current_coroutine);
     if (co == get_current_coroutine()) {
         printf("co == get_current_coroutine()\n");
         abort();
@@ -220,7 +241,6 @@ void co_pending() {
 }
 
 void co_block() {
-    printf("co_block()\n");
     set_coroutine_status(get_current_coroutine(), COROUTINE_STATUS_BLOCKED);
     if (queue_size(&co_pending_queue) > 0) {
         resume_coroutine(pop_queue(&co_pending_queue));
@@ -266,10 +286,41 @@ modify_stack_pointer_and_jmp_tp_coroutine(struct coroutine *co, coroutine_func f
 }
 
 bool co_has_pending() {
+    if (!heap_empty(&co_sleeping_heap)) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        int64_t now = ts.tv_sec * 1000000000 + ts.tv_nsec;
+        while (!heap_empty(&co_sleeping_heap)) {
+            struct quad_heap_node node = heap_top(&co_sleeping_heap);
+            if (node.key > now) {
+                break;
+            }
+            struct coroutine *co = node.data;
+            heap_pop(&co_sleeping_heap);
+            co->status = COROUTINE_STATUS_PENDING;
+            push_queue(&co_pending_queue, co);
+        }
+    }
     return queue_size(&co_pending_queue) > 0;
 }
 
+int64_t co_min_wait_time() {
+    if (heap_empty(&co_sleeping_heap)) {
+        return -1;// 如果没有在等待的协程，返回-1代表可以无限等待
+    }
+    struct quad_heap_node node = heap_top(&co_sleeping_heap);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = ts.tv_sec * 1000000000 + ts.tv_nsec;
+    int64_t wait = node.key - now;
+    return wait > 0 ? wait : 0;// 如果已经有超时，直接返回0立即执行，否则返回等待时间
+}
+
 void co_clear_block(struct coroutine *co) {
+    if (co->status == COROUTINE_STATUS_SLEEPING) {
+        // 一个协程不可能同时处于阻塞和睡眠状态
+        return;
+    }
     if (co->status != COROUTINE_STATUS_BLOCKED) {
         printf("co->status(%d) != COROUTINE_STATUS_PENDING\n", co->status);
         abort();
@@ -284,13 +335,13 @@ void co_clear_block(struct coroutine *co) {
     push_queue(&co_pending_queue, co);
 }
 
-int new_coroutine(coroutine_func func, void *arg) {
+int new_coroutine(coroutine_func func, void *arg, char *name) {
     struct coroutine *co = get_idle_coroutine();
     if (co == NULL) {
         return -1;
     }
 
-    co->name = "coroutine";
+    strncpy(co->name, name, NAME_LEN);
     jmp_buf env;
     get_current_coroutine()->jmp_env = env;
     if (setjmp(env)) {
@@ -309,29 +360,45 @@ static char *get_status_str(enum coroutine_status status) {
             return "pending";
         case COROUTINE_STATUS_BLOCKED:
             return "blocked";
+        case COROUTINE_STATUS_SLEEPING:
+            return "sleeping";
         default:
             return "unknown";
     }
 }
 
+void co_sleep(int64_t ns) {
+    struct coroutine *co = get_current_coroutine();
+    if (co == NULL) {
+        return;
+    }
+    set_coroutine_status(co, COROUTINE_STATUS_SLEEPING);
+    // get monotonic time
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = ts.tv_sec * 1000000000 + ts.tv_nsec;
+    int64_t wakeup_time = now + ns;
+    struct quad_heap_node node = {wakeup_time, co};
+    heap_push(&co_sleeping_heap, node);
+    if (queue_size(&co_pending_queue) > 0) {
+        resume_coroutine(pop_queue(&co_pending_queue));
+        return;
+    }
+    printf("all coroutine blocked\n");
+    abort();
+}
+
 void print_all_coroutine() {
-    printf("idle queue size = %d\n", queue_size(&co_idle_queue));
-    printf("pending queue size = %d\n", queue_size(&co_pending_queue));
-    printf("max_coroutine_count = %d\n", max_coroutine_count);
-    printf("inited_coroutine_count = %d\n", inited_coroutine_count);
-    printf("current_coroutine = %p\n", current_coroutine);
-    printf("g_main_co = %p\n", g_main_co);
-    for (uint32_t i = 0; i < queue_size(&co_idle_queue); i++) {
-        uint32_t pos = queue_cvt_pos(&co_idle_queue, i);
-        printf("    idle[%d] = %p\n", i, co_idle_queue.coroutines[pos]);
-    }
-    for (uint32_t i = 0; i < queue_size(&co_pending_queue); i++) {
-        uint32_t pos = queue_cvt_pos(&co_pending_queue, i);
-        printf("    pending[%d] = %p\n", i, co_pending_queue.coroutines[pos]);
-    }
+    printf("Coroutine status:\n");
+    printf("  ALL     : %d / %d\n", inited_coroutine_count, max_coroutine_count);
+    printf("  IDLE    : %d\n", queue_size(&co_idle_queue));
+    printf("  PENDING : %d\n", queue_size(&co_pending_queue));
+    printf("  SLEEPING: %ld\n", co_sleeping_heap.size);
+    printf("  ==ALL STATUS==\n");
     for (uint32_t i = 0; i < queue_size(&co_all_queue); i++) {
         uint32_t pos = queue_cvt_pos(&co_all_queue, i);
         struct coroutine *co = co_all_queue.coroutines[pos];
-        printf("    all[%d]  %s (%s)\n", i, co->name, get_status_str(co->status));
+        printf("    co[%d]  %s (%s)\n", i, co->name, get_status_str(co->status));
     }
 }
+
