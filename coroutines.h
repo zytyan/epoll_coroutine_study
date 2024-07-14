@@ -49,7 +49,7 @@ void co_sleep(int64_t ns);
 
 bool co_has_pending();
 
-void print_all_coroutine();
+void co_print_all_coroutine();
 
 static inline bool is_coroutine_runnable(struct coroutine *co) {
     if (co == NULL) {

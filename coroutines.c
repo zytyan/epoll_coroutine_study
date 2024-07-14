@@ -79,7 +79,6 @@ static struct quad_heap co_sleeping_heap = {0};
 static uint32_t max_coroutine_count = 0;
 static uint32_t inited_coroutine_count = 0;
 static struct coroutine *g_main_co = NULL;
-
 static void init_coroutine(struct coroutine *co) {
     void *stack = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
     if (stack == MAP_FAILED) {
@@ -388,7 +387,7 @@ void co_sleep(int64_t ns) {
     abort();
 }
 
-void print_all_coroutine() {
+void co_print_all_coroutine() {
     printf("Coroutine status:\n");
     printf("  ALL     : %d / %d\n", inited_coroutine_count, max_coroutine_count);
     printf("  IDLE    : %d\n", queue_size(&co_idle_queue));
@@ -400,5 +399,6 @@ void print_all_coroutine() {
         struct coroutine *co = co_all_queue.coroutines[pos];
         printf("    co[%d]  %s (%s)\n", i, co->name, get_status_str(co->status));
     }
+    printf("====END====\n");
 }
 
