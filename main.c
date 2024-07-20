@@ -11,15 +11,44 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <arpa/inet.h>
-#include <time.h>
+#include <stdarg.h>
 #include "coroutine_imp/coroutines.h"
 
 #define MAX_EVENTS 2048
 #define PORT 8080
 static bool g_running = true;
-static bool print_detail = false;
+static int log_level = 3;
 static struct co_event_loop *loop;
+static int64_t success_count = 0;
+static int64_t fail_count = 0;
 
+static void logging(int level, const char *fmt, va_list args) {
+    if (level < log_level) {
+        return;
+    }
+    vprintf(fmt, args);
+}
+
+static void info(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    logging(1, fmt, args);
+    va_end(args);
+}
+
+static void warning(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    logging(2, fmt, args);
+    va_end(args);
+}
+
+static void error(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    logging(3, fmt, args);
+    va_end(args);
+}
 
 void sig_handler(int signo) {
     if (signo == SIGINT) {
@@ -64,7 +93,7 @@ int set_server_socket() {
     }
 
     // 监听socket
-    if (listen(server_fd, 512) < 0) {
+    if (listen(server_fd, 5000) < 0) {
         perror("listen");
         close(server_fd);
         exit(EXIT_FAILURE);
@@ -92,10 +121,22 @@ static ssize_t coroutine_block_read(int fd, void *buf, size_t count, struct my_e
             data->future = &future;
             data->expect_event_mask = EPOLLIN | EPOLLHUP;
             SAVE_ERRNO(co_block());
+            data->future = NULL;
             continue;
         }
         return read_size;
     }
+}
+
+static int listen_write_event(int epoll_fd, int fd) {
+    struct epoll_event event;
+    event.events = EPOLLOUT | EPOLLIN | EPOLLET;
+    event.data.fd = fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event) == -1) {
+        perror("epoll_ctl: listen_write_event");
+        return -1;
+    }
+    return 0;
 }
 
 static ssize_t coroutine_block_write(int fd, void *buf, size_t count, struct my_epoll_data *data) {
@@ -105,7 +146,11 @@ static ssize_t coroutine_block_write(int fd, void *buf, size_t count, struct my_
             struct co_future future = co_new_future();
             data->future = &future;
             data->expect_event_mask = EPOLLOUT | EPOLLHUP;
+            if (listen_write_event(data->epoll_fd, fd) == -1) {
+                return -1;
+            }
             SAVE_ERRNO(co_block());
+            data->future = NULL;
             continue;
         } else if (write_size <= 0) {
             return write_size;
@@ -113,8 +158,12 @@ static ssize_t coroutine_block_write(int fd, void *buf, size_t count, struct my_
             struct co_future future = co_new_future();
             data->future = &future;
             data->expect_event_mask = EPOLLOUT | EPOLLHUP;
+            if (listen_write_event(data->epoll_fd, fd) == -1) {
+                return -1;
+            }
             count -= write_size;
             SAVE_ERRNO(co_block());
+            data->future = NULL;
             continue;
         }
         return write_size;
@@ -131,7 +180,7 @@ void handle_client(void *arg) {
     char buffer[1024];
     ssize_t read_size = coroutine_block_read(fd, buffer, sizeof(buffer), data);
     if (read_size == 0) {
-        printf("client closed\n");
+        info("client closed\n");
         close(fd);
         free(data);
         return;
@@ -142,7 +191,7 @@ void handle_client(void *arg) {
     co_sleep(100 * 1000 * 1000);// sleep 100ms
     ssize_t write_size = coroutine_block_write(fd, response, strlen(response), data);
     if (write_size == -1) {
-        perror("write");
+        info("cannot write");
     }
     close(fd);
     free(data);
@@ -176,11 +225,14 @@ void handle_server(int epoll_fd, int server_fd) {
         }
         char name[32];
         format_socket_address(&client_addr, name, sizeof(name));
-        if (co_spawn(loop, handle_client, data, name) != 0) {
-            perror("new_coroutine");
+        enum co_error ret = co_spawn(loop, handle_client, data, name);
+        if (ret != CO_SUCCESS) {
+            warning("new_coroutine return error, %d\n", ret);
+            fail_count++;
             free(event.data.ptr);
             close(new_socket);
         }
+        success_count++;
     }
 }
 
@@ -193,13 +245,13 @@ void handle_events(struct epoll_event *events, int num_events, struct my_epoll_d
             continue;
         }
         struct my_epoll_data *data = (struct my_epoll_data *) events[i].data.ptr;
-        if (data->future == NULL) {
-            printf("data->future==NULL\n");
-        }
         if (events[i].events & data->expect_event_mask) {
+            if (data->future == NULL) {
+                error("data->future==NULL\n");
+            }
             co_wakeup(loop, data->future);
         } else {
-            printf("unexpected event\n");
+            error("unexpected event %d\n", events[i].events);
         }
     }
 }
@@ -207,19 +259,33 @@ void handle_events(struct epoll_event *events, int num_events, struct my_epoll_d
 void sigquit_handler(int signo) {
     if (signo == SIGQUIT) {
         co_print_all_coroutine();
+        printf("success_count=%ld\nfail_count=%ld\n", success_count, fail_count);
     }
 }
 
+int get_log_level(const char *input) {
+    // -v -vv -vvv
+    while (*input == '-') {
+        input++;
+    }
+    int count = 0;
+    while (*input == 'v') {
+        count++;
+        input++;
+    }
+    return count;
+}
+
 int main(int argc, char *argv[]) {
-    if (argc > 1 && strcmp(argv[1], "-v") == 0) {
-        print_detail = true;
+    if (argc >= 2) {
+        log_level -= get_log_level(argv[1]);
     } else {
-        printf("use %s -v to print detail.\n", argv[0]);
+        printf("Usage: %s -v|-vv|-vvv\n", argv[0]);
     }
     int server_fd = set_server_socket();
     struct epoll_event event, events[MAX_EVENTS];
-    if (co_setup(1000) != 0) {
-        printf("co_setup failed\n");
+    if (co_setup(5000) != 0) {
+        error("co_setup failed\n");
         return -1;
     }
     loop = co_get_loop();

@@ -36,6 +36,8 @@ struct co_future co_new_future() {
     return future;
 }
 
+static enum co_error g_error = CO_SUCCESS;
+
 __attribute__((unused)) _Noreturn
 void coroutine_executor(coroutine_func func, void *arg, void *env) {
     struct coroutine *co = g_event_loop.current_co;
@@ -70,17 +72,17 @@ asm(".text\n"
 _Noreturn void prepare_stack_switch(void *func_ptr, void *arg, void *env, void *stack_ptr);
 
 
-static int init_coroutine(struct coroutine *co) {
+static enum co_error init_coroutine(struct coroutine *co) {
     co->jmp_env = NULL;
     co->stack = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (co->stack == MAP_FAILED) {
         free(co->jmp_env);
-        return -1;
+        return CO_ALLOC_ERR;
     }
     co->stack_size = STACK_SIZE;
     co->name[0] = '\0';
     co->status = COROUTINE_STATUS_IDLE;
-    return 0;
+    return CO_SUCCESS;
 }
 
 static void deinit_coroutine(struct coroutine *co) {
@@ -176,13 +178,17 @@ static struct coroutine *get_idle_coroutine() {
         return co;
     }
     if (queue_full(&co_all_queue)) {
+        g_error = CO_QUEUE_FULL;
         return NULL;
     }
     co = malloc(sizeof(struct coroutine));
     if (co == NULL) {
+        g_error = CO_ALLOC_ERR;
         return NULL;
     }
-    if (init_coroutine(co) != 0) {
+    enum co_error ret = init_coroutine(co);
+    if (ret != 0) {
+        g_error = ret;
         free(co);
         return NULL;
     }
@@ -190,14 +196,17 @@ static struct coroutine *get_idle_coroutine() {
     return co;
 }
 
-int co_spawn(struct co_event_loop *loop, coroutine_func func, void *arg, char *name) {
+enum co_error co_spawn(struct co_event_loop *loop, coroutine_func func, void *arg, char *name) {
     struct coroutine *co = get_idle_coroutine();
     if (co == NULL) {
-        return -1;
+        enum co_error ret = g_error;
+        g_error = CO_SUCCESS;
+        return ret;
     }
-    if (init_coroutine(co) != 0) {
+    enum co_error ret = init_coroutine(co);
+    if (ret != 0) {
         free(co);
-        return -1;
+        return ret;
     }
     strncpy(co->name, name, NAME_LEN);
     jmp_buf env;
@@ -207,7 +216,7 @@ int co_spawn(struct co_event_loop *loop, coroutine_func func, void *arg, char *n
         prepare_stack_switch(func, arg, env, co->stack + co->stack_size);
     }
     loop->current_co = cur_co;
-    return 0;
+    return CO_SUCCESS;
 }
 
 int co_dispatch(struct co_event_loop *loop) {
@@ -314,6 +323,9 @@ void co_print_all_coroutine() {
     printf("All coroutine:    %d\n", queue_size(&co_all_queue));
     for (int i = 0; i < queue_size(&co_all_queue); i++) {
         struct coroutine *co = co_all_queue.coroutines[queue_cvt_pos(&co_all_queue, i)];
+        if (co->status == COROUTINE_STATUS_IDLE) {
+            continue;
+        }
         printf("    coroutine %s: %s\n", co->name, get_status_str(co->status));
     }
     printf("===END===\n");

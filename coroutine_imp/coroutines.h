@@ -27,6 +27,13 @@ struct co_event_loop {
     void *current_co;
     int64_t sleep_count;
 };
+enum co_error {
+    CO_SUCCESS = 0,
+    CO_ALLOC_ERR = 1,
+    CO_QUEUE_FULL = 2,
+    CO_QUEUE_EMPTY = 3,
+    CO_HEAP_EMPTY = 4,
+};
 
 typedef void (*coroutine_func)(void *);
 
@@ -40,7 +47,7 @@ void co_sleep(int64_t ns);
 
 int co_dispatch(struct co_event_loop *loop);
 
-int co_spawn(struct co_event_loop *loop, coroutine_func func, void *arg, char *name);
+enum co_error co_spawn(struct co_event_loop *loop, coroutine_func func, void *arg, char *name);
 
 struct co_future co_new_future();
 
