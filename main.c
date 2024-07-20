@@ -11,17 +11,28 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <arpa/inet.h>
-#include "coroutines.h"
+#include <time.h>
+#include "coroutine_imp/coroutines.h"
 
 #define MAX_EVENTS 2048
 #define PORT 8080
 static bool g_running = true;
 static bool print_detail = false;
+static struct co_event_loop *loop;
+
 
 void sig_handler(int signo) {
     if (signo == SIGINT) {
         g_running = false;
     }
+}
+
+int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) {
+        return -1;
+    }
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 int set_server_socket() {
@@ -53,7 +64,7 @@ int set_server_socket() {
     }
 
     // 监听socket
-    if (listen(server_fd, 3) < 0) {
+    if (listen(server_fd, 512) < 0) {
         perror("listen");
         close(server_fd);
         exit(EXIT_FAILURE);
@@ -64,39 +75,22 @@ int set_server_socket() {
 struct my_epoll_data {
     int fd;
     int epoll_fd;
-    uint32_t events;
-    struct coroutine *co;
-
-    void (*on_event)(void *);
+    uint32_t expect_event_mask;
+    struct co_future *future;
 };
-
-void real_on_event(void *arg) {
-    struct my_epoll_data *data = (struct my_epoll_data *) arg;
-    if (data->co) {
-        co_clear_block(data->co);
-    } else {
-        printf("ohhh...\n");
-    }
-}
-
-int set_nonblocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) {
-        return -1;
-    }
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
 #define SAVE_ERRNO(x) do {\
     int _errno = errno;\
     x;\
     errno = _errno;\
 } while(0)
 
-static ssize_t coroutine_block_read(int fd, void *buf, size_t count) {
+static ssize_t coroutine_block_read(int fd, void *buf, size_t count, struct my_epoll_data *data) {
     while (true) {
         ssize_t read_size = read(fd, buf, count);
         if (read_size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct co_future future = co_new_future();
+            data->future = &future;
+            data->expect_event_mask = EPOLLIN | EPOLLHUP;
             SAVE_ERRNO(co_block());
             continue;
         }
@@ -104,10 +98,22 @@ static ssize_t coroutine_block_read(int fd, void *buf, size_t count) {
     }
 }
 
-static ssize_t coroutine_block_write(int fd, const void *buf, size_t count) {
+static ssize_t coroutine_block_write(int fd, void *buf, size_t count, struct my_epoll_data *data) {
     while (true) {
         ssize_t write_size = write(fd, buf, count);
         if (write_size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct co_future future = co_new_future();
+            data->future = &future;
+            data->expect_event_mask = EPOLLOUT | EPOLLHUP;
+            SAVE_ERRNO(co_block());
+            continue;
+        } else if (write_size <= 0) {
+            return write_size;
+        } else if (write_size < count) {
+            struct co_future future = co_new_future();
+            data->future = &future;
+            data->expect_event_mask = EPOLLOUT | EPOLLHUP;
+            count -= write_size;
             SAVE_ERRNO(co_block());
             continue;
         }
@@ -115,21 +121,17 @@ static ssize_t coroutine_block_write(int fd, const void *buf, size_t count) {
     }
 }
 
+int format_socket_address(struct sockaddr_in *addr, char *buf, size_t size) {
+    return snprintf(buf, size, "%s:%d", inet_ntoa(addr->sin_addr), ntohs(addr->sin_port));
+}
+
 void handle_client(void *arg) {
     struct my_epoll_data *data = (struct my_epoll_data *) arg;
-    data->co = get_current_coroutine();
-    data->on_event = real_on_event;
     int fd = data->fd;
     char buffer[1024];
-    if (data->events & EPOLLHUP) {
-        printf("EPOLLHUP\n");
-        close(fd);
-        free(data);
-        printf("return at EPOLLUP\n");
-        return;
-    }
-    ssize_t read_size = coroutine_block_read(fd, buffer, sizeof(buffer));
+    ssize_t read_size = coroutine_block_read(fd, buffer, sizeof(buffer), data);
     if (read_size == 0) {
+        printf("client closed\n");
         close(fd);
         free(data);
         return;
@@ -138,16 +140,12 @@ void handle_client(void *arg) {
                      "Content-Length: 15\r\n\r\n"
                      "Hello, World!\r\n";
     co_sleep(100 * 1000 * 1000);// sleep 100ms
-    ssize_t write_size = coroutine_block_write(fd, response, strlen(response));
+    ssize_t write_size = coroutine_block_write(fd, response, strlen(response), data);
     if (write_size == -1) {
         perror("write");
     }
     close(fd);
     free(data);
-}
-
-int format_socket_address(struct sockaddr_in *addr, char *buf, size_t size) {
-    return snprintf(buf, 32, "%s:%d", inet_ntoa(addr->sin_addr), ntohs(addr->sin_port));
 }
 
 void handle_server(int epoll_fd, int server_fd) {
@@ -164,13 +162,13 @@ void handle_server(int epoll_fd, int server_fd) {
         }
         set_nonblocking(new_socket);
         struct epoll_event event;
-        event.events = EPOLLIN | EPOLLOUT | EPOLLET;
+        event.events = EPOLLIN | EPOLLET;
         event.data.ptr = malloc(sizeof(struct my_epoll_data));
         struct my_epoll_data *data = (struct my_epoll_data *) event.data.ptr;
         data->fd = new_socket;
         data->epoll_fd = epoll_fd;
-        data->on_event = real_on_event;
-        data->co = NULL;
+        data->expect_event_mask = EPOLLIN | EPOLLHUP;
+        data->future = NULL;
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_socket, &event) == -1) {
             free(event.data.ptr);
             perror("epoll_ctl: new_socket");
@@ -178,7 +176,7 @@ void handle_server(int epoll_fd, int server_fd) {
         }
         char name[32];
         format_socket_address(&client_addr, name, sizeof(name));
-        if (new_coroutine(handle_client, data, name) != 0) {
+        if (co_spawn(loop, handle_client, data, name) != 0) {
             perror("new_coroutine");
             free(event.data.ptr);
             close(new_socket);
@@ -195,11 +193,14 @@ void handle_events(struct epoll_event *events, int num_events, struct my_epoll_d
             continue;
         }
         struct my_epoll_data *data = (struct my_epoll_data *) events[i].data.ptr;
-        if (print_detail) {
-            printf("events: %d\n", events[i].events);
+        if (data->future == NULL) {
+            printf("data->future==NULL\n");
         }
-        data->events = events[i].events;
-        data->on_event(data);
+        if (events[i].events & data->expect_event_mask) {
+            co_wakeup(loop, data->future);
+        } else {
+            printf("unexpected event\n");
+        }
     }
 }
 
@@ -217,8 +218,11 @@ int main(int argc, char *argv[]) {
     }
     int server_fd = set_server_socket();
     struct epoll_event event, events[MAX_EVENTS];
-
-    setup_coroutine(1000);
+    if (co_setup(1000) != 0) {
+        printf("co_setup failed\n");
+        return -1;
+    }
+    loop = co_get_loop();
     // 创建epoll实例
     int epoll_fd = epoll_create1(0);
     if (epoll_fd == -1) {
@@ -231,8 +235,8 @@ int main(int argc, char *argv[]) {
     struct my_epoll_data epoll_h = {
             .fd = epoll_fd,
             .epoll_fd = epoll_fd,
-            .on_event = real_on_event,
-            .co = NULL,
+            .expect_event_mask = EPOLLIN | EPOLLET,
+            .future = NULL,
     };
     event.events = EPOLLIN | EPOLLET;
     event.data.ptr = &epoll_h;
@@ -263,22 +267,14 @@ int main(int argc, char *argv[]) {
                 close(epoll_fd);
                 exit(EXIT_FAILURE);
             }
+            co_dispatch(loop);
             continue;
         }
         handle_events(events, num_events, &epoll_h, server_fd);
-        if (print_detail) {
-            printf("co_has_pending: %d\n", co_has_pending());
-        }
-        while (co_has_pending()) {
-            if (print_detail) {
-                printf("co_dispatch...\n");
-            }
-            co_dispatch();
-        }
+        co_dispatch(loop);
     }
-    teardown_coroutine();
+    co_teardown();
     close(server_fd);
     close(epoll_fd);
     return 0;
 }
-

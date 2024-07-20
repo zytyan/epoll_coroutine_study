@@ -97,6 +97,7 @@ int init_heap(quad_heap *heap, int64_t capacity) {
     heap->size = 0;
     heap->nodes = (quad_heap_node *) malloc(sizeof(quad_heap_node) * capacity);
     if (heap->nodes == NULL) {
+        heap->capacity = 0;
         return -1;
     }
     return 0;
